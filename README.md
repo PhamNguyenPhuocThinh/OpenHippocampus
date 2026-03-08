@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="_statics/goclaw.png" alt="GoClaw" />
+  <img src="_statics/OpenHippocampus.png" alt="OpenHippocampus" />
 </p>
 
 # GoClaw

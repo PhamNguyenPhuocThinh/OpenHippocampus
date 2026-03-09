@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/google/uuid"
@@ -17,6 +18,7 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/channels"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/discord"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/feishu"
+	slackchannel "github.com/nextlevelbuilder/goclaw/internal/channels/slack"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/telegram"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/whatsapp"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/zalo"
@@ -60,37 +62,6 @@ func runGateway() {
 	if err != nil {
 		slog.Error("failed to load config", "error", err)
 		os.Exit(1)
-	}
-
-	// Auto-detect: if no provider API key is configured, help the user.
-	// Also trigger auto-onboard when config file doesn't exist (first run),
-	// even if env vars provide API keys — DB seeding is required.
-	_, cfgStatErr := os.Stat(cfgPath)
-	configMissing := os.IsNotExist(cfgStatErr)
-	if !cfg.HasAnyProvider() || configMissing {
-		// Docker / CI: env vars provide API keys → non-interactive auto-onboard.
-		if canAutoOnboard() {
-			if runAutoOnboard(cfgPath) {
-				cfg, _ = config.Load(cfgPath)
-			} else {
-				os.Exit(1)
-			}
-		} else if _, statErr := os.Stat(cfgPath); statErr == nil {
-			// Config file exists — user already onboarded but forgot to source .env.local.
-			envPath := filepath.Join(filepath.Dir(cfgPath), ".env.local")
-			fmt.Println("No AI provider API key found. Did you forget to load your secrets?")
-			fmt.Println()
-			fmt.Printf("  source %s && ./goclaw\n", envPath)
-			fmt.Println()
-			fmt.Println("Or re-run the setup wizard:  ./goclaw onboard")
-			os.Exit(1)
-		} else {
-			// No config file at all → first time, redirect to onboard wizard.
-			fmt.Println("No configuration found. Starting setup wizard...")
-			fmt.Println()
-			runOnboard()
-			return
-		}
 	}
 
 	// Create core components
@@ -188,6 +159,10 @@ func runGateway() {
 	// Vision fallback tool (for non-vision providers like MiniMax)
 	toolsReg.Register(tools.NewReadImageTool(providerRegistry))
 	toolsReg.Register(tools.NewCreateImageTool(providerRegistry))
+
+	// Audio generation tool (MiniMax music + ElevenLabs sound effects)
+	toolsReg.Register(tools.NewCreateAudioTool(providerRegistry,
+		cfg.Tts.ElevenLabs.APIKey, cfg.Tts.ElevenLabs.BaseURL))
 
 	// TTS (text-to-speech) system
 	ttsMgr := setupTTS(cfg)
@@ -313,9 +288,11 @@ func runGateway() {
 
 	// Block exec from accessing sensitive directories (data dir, .goclaw, config file).
 	// Prevents `cp /app/data/config.json workspace/` and similar exfiltration.
+	// Exception: .goclaw/skills-store/ is allowed (skills may contain executable scripts).
 	if execTool, ok := toolsReg.Get("exec"); ok {
 		if et, ok := execTool.(*tools.ExecTool); ok {
 			et.DenyPaths(dataDir, ".goclaw/")
+			et.AllowPathExemptions(".goclaw/skills-store/")
 			if cfgPath := os.Getenv("GOCLAW_CONFIG"); cfgPath != "" {
 				et.DenyPaths(cfgPath)
 			}
@@ -694,6 +671,7 @@ func runGateway() {
 		instanceLoader.RegisterFactory("zalo_oa", zalo.Factory)
 		instanceLoader.RegisterFactory("zalo_personal", zalopersonal.Factory)
 		instanceLoader.RegisterFactory("whatsapp", whatsapp.Factory)
+		instanceLoader.RegisterFactory("slack", slackchannel.Factory)
 		if err := instanceLoader.LoadAll(context.Background()); err != nil {
 			slog.Error("failed to load channel instances from DB", "error", err)
 		}
@@ -747,6 +725,16 @@ func runGateway() {
 		} else {
 			channelMgr.RegisterChannel("zalo_personal", zp)
 			slog.Info("zca (zalo personal) channel enabled (config)")
+		}
+	}
+
+	if cfg.Channels.Slack.Enabled && cfg.Channels.Slack.BotToken != "" && cfg.Channels.Slack.AppToken != "" && instanceLoader == nil {
+		sl, err := slackchannel.New(cfg.Channels.Slack, msgBus, nil)
+		if err != nil {
+			slog.Error("failed to initialize slack channel", "error", err)
+		} else {
+			channelMgr.RegisterChannel("slack", sl)
+			slog.Info("slack channel enabled (config)")
 		}
 	}
 
@@ -808,9 +796,17 @@ func runGateway() {
 
 	// Wire pairing approval notification → channel (matching TS notifyPairingApproved).
 	botName := cfg.ResolveDisplayName("default")
-	pairingMethods.SetOnApprove(func(ctx context.Context, channel, chatID string) {
+	pairingMethods.SetOnApprove(func(ctx context.Context, channel, chatID, senderID string) {
 		msg := fmt.Sprintf("✅ %s access approved. Send a message to start chatting.", botName)
-		if err := channelMgr.SendToChannel(ctx, channel, chatID, msg); err != nil {
+		// Group pairings need group_id metadata so channels (e.g. Zalo) route to group API.
+		if strings.HasPrefix(senderID, "group:") {
+			msgBus.PublishOutbound(bus.OutboundMessage{
+				Channel:  channel,
+				ChatID:   chatID,
+				Content:  msg,
+				Metadata: map[string]string{"group_id": chatID},
+			})
+		} else if err := channelMgr.SendToChannel(ctx, channel, chatID, msg); err != nil {
 			slog.Warn("failed to send pairing approval notification", "channel", channel, "chatID", chatID, "error", err)
 		}
 	})
@@ -904,7 +900,10 @@ func runGateway() {
 	defer sched.Stop()
 
 	// Start cron service with job handler (routes through scheduler's cron lane)
-	pgStores.Cron.SetOnJob(makeCronJobHandler(sched, msgBus, cfg))
+	pgStores.Cron.SetOnJob(makeCronJobHandler(sched, msgBus, cfg, channelMgr))
+	pgStores.Cron.SetOnEvent(func(event store.CronEvent) {
+		server.BroadcastEvent(*protocol.NewEvent(protocol.EventCron, event))
+	})
 	if err := pgStores.Cron.Start(); err != nil {
 		slog.Warn("cron service failed to start", "error", err)
 	}

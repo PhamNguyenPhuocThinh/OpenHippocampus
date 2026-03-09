@@ -197,6 +197,10 @@ func (l *Loop) runLoop(ctx context.Context, req RunRequest) (*RunResult, error) 
 	if l.builtinToolSettings != nil {
 		ctx = tools.WithBuiltinToolSettings(ctx, l.builtinToolSettings)
 	}
+	// Inject channel type into context for tools (e.g. message tool needs it for Zalo group routing)
+	if req.ChannelType != "" {
+		ctx = tools.WithToolChannelType(ctx, req.ChannelType)
+	}
 
 	// Per-user workspace isolation.
 	// Workspace path comes from user_agent_profiles (includes channel segment
@@ -295,7 +299,7 @@ func (l *Loop) runLoop(ctx context.Context, req RunRequest) (*RunResult, error) 
 
 	// buildMessages resolves context files once and also detects BOOTSTRAP.md presence
 	// (hadBootstrap) — no extra DB roundtrip needed for bootstrap detection.
-	messages, hadBootstrap := l.buildMessages(ctx, history, summary, req.Message, req.ExtraSystemPrompt, req.SessionKey, req.Channel, req.PeerKind, req.UserID, req.HistoryLimit, req.SkillFilter)
+	messages, hadBootstrap := l.buildMessages(ctx, history, summary, req.Message, req.ExtraSystemPrompt, req.SessionKey, req.Channel, req.ChannelType, req.PeerKind, req.UserID, req.HistoryLimit, req.SkillFilter)
 
 	// 1b. Determine image routing strategy.
 	// If read_image tool has a dedicated vision provider, images are NOT attached inline
@@ -760,9 +764,10 @@ func (l *Loop) runLoop(ctx context.Context, req RunRequest) (*RunResult, error) 
 			}
 
 			toolResultPayload := map[string]interface{}{
-				"name":     tc.Name,
-				"id":       tc.ID,
-				"is_error": result.IsError,
+				"name":      tc.Name,
+				"id":        tc.ID,
+				"is_error":  result.IsError,
+				"arguments": tc.Arguments,
 			}
 			if result.IsError && result.ForLLM != "" {
 				toolResultPayload["content"] = result.ForLLM
@@ -899,9 +904,10 @@ func (l *Loop) runLoop(ctx context.Context, req RunRequest) (*RunResult, error) 
 				}
 
 				parToolResultPayload := map[string]interface{}{
-					"name":     r.tc.Name,
-					"id":       r.tc.ID,
-					"is_error": r.result.IsError,
+					"name":      r.tc.Name,
+					"id":        r.tc.ID,
+					"is_error":  r.result.IsError,
+					"arguments": r.tc.Arguments,
 				}
 				if r.result.IsError && r.result.ForLLM != "" {
 					parToolResultPayload["content"] = r.result.ForLLM

@@ -40,7 +40,7 @@ type Channel struct {
 	dedup           sync.Map // message_id → struct{}
 	pairingDebounce sync.Map // senderID → time.Time
 	reactions       sync.Map // chatID → *reactionState
-	approvedGroups sync.Map // chatID → true (in-memory cache for paired groups)
+	approvedGroups  sync.Map // chatID → true (in-memory cache for paired groups)
 	groupAllowList  []string
 	groupHistory    *channels.PendingHistory
 	historyLimit    int
@@ -61,7 +61,7 @@ type senderCacheEntry struct {
 }
 
 // New creates a new Feishu/Lark channel.
-func New(cfg config.FeishuConfig, msgBus *bus.MessageBus, pairingSvc store.PairingStore) (*Channel, error) {
+func New(cfg config.FeishuConfig, msgBus *bus.MessageBus, pairingSvc store.PairingStore, pendingStore store.PendingMessageStore) (*Channel, error) {
 	if cfg.AppID == "" || cfg.AppSecret == "" {
 		return nil, fmt.Errorf("feishu app_id and app_secret are required")
 	}
@@ -71,7 +71,7 @@ func New(cfg config.FeishuConfig, msgBus *bus.MessageBus, pairingSvc store.Pairi
 
 	client := NewLarkClient(cfg.AppID, cfg.AppSecret, domain)
 
-	base := channels.NewBaseChannel("feishu", msgBus, cfg.AllowFrom)
+	base := channels.NewBaseChannel(channels.TypeFeishu, msgBus, cfg.AllowFrom)
 	base.ValidatePolicy(cfg.DMPolicy, cfg.GroupPolicy)
 
 	historyLimit := cfg.HistoryLimit
@@ -85,7 +85,7 @@ func New(cfg config.FeishuConfig, msgBus *bus.MessageBus, pairingSvc store.Pairi
 		client:         client,
 		pairingService: pairingSvc,
 		groupAllowList: cfg.GroupAllowFrom,
-		groupHistory:   channels.NewPendingHistory(),
+		groupHistory:   channels.MakeHistory(channels.TypeFeishu, pendingStore),
 		historyLimit:   historyLimit,
 		stopCh:         make(chan struct{}),
 	}, nil
@@ -93,6 +93,7 @@ func New(cfg config.FeishuConfig, msgBus *bus.MessageBus, pairingSvc store.Pairi
 
 // Start begins receiving Feishu events via WebSocket or Webhook.
 func (c *Channel) Start(ctx context.Context) error {
+	c.groupHistory.StartFlusher()
 	slog.Info("starting feishu/lark bot")
 
 	// Probe bot identity
@@ -120,8 +121,14 @@ func (c *Channel) Start(ctx context.Context) error {
 // BlockReplyEnabled returns the per-channel block_reply override (nil = inherit gateway default).
 func (c *Channel) BlockReplyEnabled() *bool { return c.cfg.BlockReply }
 
+// SetPendingCompaction configures LLM-based auto-compaction for pending messages.
+func (c *Channel) SetPendingCompaction(cfg *channels.CompactionConfig) {
+	c.groupHistory.SetCompactionConfig(cfg)
+}
+
 // Stop shuts down the Feishu channel.
 func (c *Channel) Stop(_ context.Context) error {
+	c.groupHistory.StopFlusher()
 	slog.Info("stopping feishu/lark bot")
 	close(c.stopCh)
 
@@ -389,9 +396,9 @@ func resolveReceiveIDType(id string) string {
 // --- Content builders ---
 
 func buildPostContent(text string) string {
-	content := map[string]interface{}{
-		"zh_cn": map[string]interface{}{
-			"content": [][]map[string]interface{}{
+	content := map[string]any{
+		"zh_cn": map[string]any{
+			"content": [][]map[string]any{
 				{
 					{
 						"tag":  "md",
@@ -405,14 +412,14 @@ func buildPostContent(text string) string {
 	return string(data)
 }
 
-func buildMarkdownCard(text string) map[string]interface{} {
-	return map[string]interface{}{
+func buildMarkdownCard(text string) map[string]any {
+	return map[string]any{
 		"schema": "2.0",
-		"config": map[string]interface{}{
+		"config": map[string]any{
 			"wide_screen_mode": true,
 		},
-		"body": map[string]interface{}{
-			"elements": []map[string]interface{}{
+		"body": map[string]any{
+			"elements": []map[string]any{
 				{
 					"tag":     "markdown",
 					"content": text,

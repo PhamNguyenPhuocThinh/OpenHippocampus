@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"path/filepath"
 
@@ -11,7 +12,7 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/config"
 	"github.com/nextlevelbuilder/goclaw/internal/hooks"
-	httpapi "github.com/nextlevelbuilder/goclaw/internal/http"
+	kg "github.com/nextlevelbuilder/goclaw/internal/knowledgegraph"
 	mcpbridge "github.com/nextlevelbuilder/goclaw/internal/mcp"
 	"github.com/nextlevelbuilder/goclaw/internal/media"
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
@@ -151,6 +152,8 @@ func wireExtras(
 		MCPPool:                mcpPool,
 		GroupWriterCache:       groupWriterCache,
 		MediaStore:             mediaStore,
+		ModelPricing:           appCfg.Telemetry.ModelPricing,
+		TracingStore:           stores.Tracing,
 		OnEvent: func(event agent.AgentEvent) {
 			msgBus.Broadcast(bus.Event{
 				Name:    protocol.EventAgent,
@@ -163,6 +166,15 @@ func wireExtras(
 	// Wire virtual FS interceptors: route context + memory file reads/writes to DB.
 	// Share ONE ContextFileInterceptor instance between read_file and write_file
 	// so they share the same cache.
+	// Write-capable tools share a memory interceptor with optional KG extraction hook.
+	var writeMemIntc *tools.MemoryInterceptor
+	if stores.Memory != nil {
+		writeMemIntc = tools.NewMemoryInterceptor(stores.Memory, workspace)
+		// Hook KG extraction on memory writes if KG store is available
+		if stores.KnowledgeGraph != nil && stores.BuiltinTools != nil {
+			writeMemIntc.SetKGExtractFunc(buildKGExtractFunc(stores.KnowledgeGraph, stores.BuiltinTools, providerReg))
+		}
+	}
 	if readTool, ok := toolsReg.Get("read_file"); ok {
 		if ia, ok := readTool.(tools.InterceptorAware); ok {
 			if contextFileInterceptor != nil {
@@ -178,8 +190,8 @@ func wireExtras(
 			if contextFileInterceptor != nil {
 				ia.SetContextFileInterceptor(contextFileInterceptor)
 			}
-			if stores.Memory != nil {
-				ia.SetMemoryInterceptor(tools.NewMemoryInterceptor(stores.Memory, workspace))
+			if writeMemIntc != nil {
+				ia.SetMemoryInterceptor(writeMemIntc)
 			}
 		}
 	}
@@ -188,8 +200,8 @@ func wireExtras(
 			if contextFileInterceptor != nil {
 				ia.SetContextFileInterceptor(contextFileInterceptor)
 			}
-			if stores.Memory != nil {
-				ia.SetMemoryInterceptor(tools.NewMemoryInterceptor(stores.Memory, workspace))
+			if writeMemIntc != nil {
+				ia.SetMemoryInterceptor(writeMemIntc)
 			}
 		}
 	}
@@ -228,6 +240,16 @@ func wireExtras(
 			}
 		}
 		slog.Info("memory layering enabled (Postgres)")
+	}
+
+	// Wire knowledge graph store on KG tool
+	if stores.KnowledgeGraph != nil {
+		if kgTool, ok := toolsReg.Get("knowledge_graph_search"); ok {
+			if kgt, ok := kgTool.(*tools.KnowledgeGraphSearchTool); ok {
+				kgt.SetKGStore(stores.KnowledgeGraph)
+			}
+		}
+		slog.Info("knowledge graph tool wired (Postgres)")
 	}
 
 	// --- Cache invalidation event subscribers ---
@@ -515,62 +537,62 @@ func wireExtras(
 	return contextFileInterceptor, delegateMgr, mcpPool, mediaStore
 }
 
-// wireHTTP creates HTTP handlers (agents + skills + traces + MCP + custom tools + channel instances + providers + delegations + builtin tools).
-func wireHTTP(stores *store.Stores, token string, msgBus *bus.MessageBus, toolsReg *tools.Registry, providerReg *providers.Registry, isOwner func(string) bool, gatewayAddr string, mcpToolLister httpapi.MCPToolLister) (*httpapi.AgentsHandler, *httpapi.SkillsHandler, *httpapi.TracesHandler, *httpapi.MCPHandler, *httpapi.CustomToolsHandler, *httpapi.ChannelInstancesHandler, *httpapi.ProvidersHandler, *httpapi.DelegationsHandler, *httpapi.BuiltinToolsHandler) {
-	var agentsH *httpapi.AgentsHandler
-	var skillsH *httpapi.SkillsHandler
-	var tracesH *httpapi.TracesHandler
-	var mcpH *httpapi.MCPHandler
-	var customToolsH *httpapi.CustomToolsHandler
-	var channelInstancesH *httpapi.ChannelInstancesHandler
-	var providersH *httpapi.ProvidersHandler
-	var delegationsH *httpapi.DelegationsHandler
-	var builtinToolsH *httpapi.BuiltinToolsHandler
-
-	if stores != nil && stores.Agents != nil {
-		var summoner *httpapi.AgentSummoner
-		if providerReg != nil {
-			summoner = httpapi.NewAgentSummoner(stores.Agents, providerReg, msgBus)
-		}
-		agentsH = httpapi.NewAgentsHandler(stores.Agents, token, msgBus, summoner, isOwner)
-	}
-
-	if stores != nil && stores.Skills != nil {
-		if pgSkills, ok := stores.Skills.(*pg.PGSkillStore); ok {
-			dirs := pgSkills.Dirs()
-			if len(dirs) > 0 {
-				skillsH = httpapi.NewSkillsHandler(pgSkills, dirs[0], token, msgBus)
-			}
-		}
-	}
-
-	if stores != nil && stores.Tracing != nil {
-		tracesH = httpapi.NewTracesHandler(stores.Tracing, token)
-	}
-
-	if stores != nil && stores.MCP != nil {
-		mcpH = httpapi.NewMCPHandler(stores.MCP, token, msgBus, mcpToolLister)
-	}
-
-	if stores != nil && stores.CustomTools != nil {
-		customToolsH = httpapi.NewCustomToolsHandler(stores.CustomTools, token, msgBus, toolsReg)
-	}
-
-	if stores != nil && stores.ChannelInstances != nil {
-		channelInstancesH = httpapi.NewChannelInstancesHandler(stores.ChannelInstances, stores.Agents, token, msgBus)
-	}
-
-	if stores != nil && stores.Providers != nil {
-		providersH = httpapi.NewProvidersHandler(stores.Providers, stores.ConfigSecrets, token, providerReg, gatewayAddr)
-	}
-
-	if stores != nil && stores.Teams != nil {
-		delegationsH = httpapi.NewDelegationsHandler(stores.Teams, token)
-	}
-
-	if stores != nil && stores.BuiltinTools != nil {
-		builtinToolsH = httpapi.NewBuiltinToolsHandler(stores.BuiltinTools, token, msgBus)
-	}
-
-	return agentsH, skillsH, tracesH, mcpH, customToolsH, channelInstancesH, providersH, delegationsH, builtinToolsH
+// kgSettings holds KG extraction settings from the builtin_tools table.
+type kgSettings struct {
+	ExtractOnMemoryWrite bool    `json:"extract_on_memory_write"`
+	ExtractionProvider   string  `json:"extraction_provider"`
+	ExtractionModel      string  `json:"extraction_model"`
+	MinConfidence        float64 `json:"min_confidence"`
 }
+
+// buildKGExtractFunc returns a callback that extracts entities from memory content.
+// Settings are read from the builtin_tools table on each invocation (not cached),
+// so changes take effect immediately without restart.
+func buildKGExtractFunc(kgStore store.KnowledgeGraphStore, bts store.BuiltinToolStore, providerReg *providers.Registry) tools.KGExtractFunc {
+	return func(ctx context.Context, agentID, userID, content string) {
+		slog.Info("kg extract: triggered", "agent", agentID, "user", userID, "content_len", len(content))
+		// Read settings from DB on each call so admin changes take effect immediately
+		raw, err := bts.GetSettings(ctx, "knowledge_graph_search")
+		if err != nil || raw == nil {
+			slog.Warn("kg extract: no settings found", "error", err)
+			return
+		}
+		var settings kgSettings
+		if err := json.Unmarshal(raw, &settings); err != nil {
+			slog.Warn("kg extract: invalid settings", "error", err)
+			return
+		}
+		if !settings.ExtractOnMemoryWrite || settings.ExtractionProvider == "" || settings.ExtractionModel == "" {
+			return
+		}
+
+		p, err := providerReg.Get(settings.ExtractionProvider)
+		if err != nil {
+			slog.Warn("kg extract: provider not found", "provider", settings.ExtractionProvider, "error", err)
+			return
+		}
+		extractor := kg.NewExtractor(p, settings.ExtractionModel, settings.MinConfidence)
+		result, err := extractor.Extract(ctx, content)
+		if err != nil {
+			slog.Warn("kg extract: extraction failed", "agent", agentID, "error", err)
+			return
+		}
+		if len(result.Entities) == 0 && len(result.Relations) == 0 {
+			return
+		}
+		for i := range result.Entities {
+			result.Entities[i].AgentID = agentID
+			result.Entities[i].UserID = userID
+		}
+		for i := range result.Relations {
+			result.Relations[i].AgentID = agentID
+			result.Relations[i].UserID = userID
+		}
+		if err := kgStore.IngestExtraction(ctx, agentID, userID, result.Entities, result.Relations); err != nil {
+			slog.Warn("kg extract: ingest failed", "agent", agentID, "error", err)
+			return
+		}
+		slog.Info("kg extract: ingested from memory write", "agent", agentID, "entities", len(result.Entities), "relations", len(result.Relations))
+	}
+}
+

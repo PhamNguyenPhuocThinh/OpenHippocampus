@@ -78,6 +78,21 @@ const StoragePage = lazy(() =>
 const SetupPage = lazy(() =>
   import("@/pages/setup/setup-page").then((m) => ({ default: m.SetupPage })),
 );
+const PendingMessagesPage = lazy(() =>
+  import("@/pages/pending-messages/pending-messages-page").then((m) => ({ default: m.PendingMessagesPage })),
+);
+const MemoryPage = lazy(() =>
+  import("@/pages/memory/memory-page").then((m) => ({ default: m.MemoryPage })),
+);
+const KnowledgeGraphPage = lazy(() =>
+  import("@/pages/knowledge-graph/knowledge-graph-page").then((m) => ({ default: m.KnowledgeGraphPage })),
+);
+const ContactsPage = lazy(() =>
+  import("@/pages/contacts/contacts-page").then((m) => ({ default: m.ContactsPage })),
+);
+const ActivityPage = lazy(() =>
+  import("@/pages/activity/activity-page").then((m) => ({ default: m.ActivityPage })),
+);
 
 function PageLoader() {
   return (
@@ -133,8 +148,10 @@ export function AppRoutes() {
           <Route path={ROUTES.EVENTS} element={<EventsPage />} />
           <Route path={ROUTES.DELEGATIONS} element={<DelegationsPage />} />
           <Route path={ROUTES.USAGE} element={<UsagePage />} />
+          <Route path={ROUTES.ACTIVITY} element={<ActivityPage />} />
           <Route path={ROUTES.CHANNELS} element={<ChannelsPage key="list" />} />
           <Route path={ROUTES.CHANNEL_DETAIL} element={<ChannelsPage key="detail" />} />
+          <Route path={ROUTES.CONTACTS} element={<ContactsPage />} />
           <Route path={ROUTES.APPROVALS} element={<ApprovalsPage />} />
           <Route path={ROUTES.NODES} element={<NodesPage />} />
           <Route path={ROUTES.LOGS} element={<LogsPage />} />
@@ -144,6 +161,9 @@ export function AppRoutes() {
           <Route path={ROUTES.MCP} element={<MCPPage />} />
           <Route path={ROUTES.TTS} element={<TtsPage />} />
           <Route path={ROUTES.STORAGE} element={<StoragePage />} />
+          <Route path={ROUTES.PENDING_MESSAGES} element={<PendingMessagesPage />} />
+          <Route path={ROUTES.MEMORY} element={<MemoryPage />} />
+          <Route path={ROUTES.KNOWLEDGE_GRAPH} element={<KnowledgeGraphPage />} />
         </Route>
 
         {/* Catch-all → overview */}

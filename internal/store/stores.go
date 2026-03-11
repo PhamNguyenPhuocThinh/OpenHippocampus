@@ -20,4 +20,8 @@ type Stores struct {
 	AgentLinks       AgentLinkStore
 	Teams            TeamStore
 	BuiltinTools     BuiltinToolStore
+	PendingMessages  PendingMessageStore
+	KnowledgeGraph   KnowledgeGraphStore
+	Contacts         ContactStore
+	Activity         ActivityStore
 }

@@ -14,6 +14,9 @@ export interface SessionInfo {
   userID?: string;
   metadata?: Record<string, string>;
   agentName?: string;
+  estimatedTokens?: number;
+  contextWindow?: number;
+  compactionCount?: number;
 }
 
 export interface SessionPreview {
@@ -26,6 +29,7 @@ export interface SessionPreview {
 export interface Message {
   role: "user" | "assistant" | "tool";
   content: string;
+  thinking?: string;
   tool_calls?: ToolCall[];
   tool_call_id?: string;
 }

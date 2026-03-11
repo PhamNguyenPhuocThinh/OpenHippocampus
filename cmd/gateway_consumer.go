@@ -5,8 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"mime"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -17,35 +15,18 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/channels"
 	"github.com/nextlevelbuilder/goclaw/internal/config"
+	"github.com/nextlevelbuilder/goclaw/internal/i18n"
 	"github.com/nextlevelbuilder/goclaw/internal/scheduler"
 	"github.com/nextlevelbuilder/goclaw/internal/sessions"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 	"github.com/nextlevelbuilder/goclaw/internal/tools"
 )
 
-// makeSchedulerRunFunc creates the RunFunc for the scheduler.
-// It extracts the agentID from the session key and routes to the correct agent loop.
-func makeSchedulerRunFunc(agents *agent.Router, cfg *config.Config) scheduler.RunFunc {
-	return func(ctx context.Context, req agent.RunRequest) (*agent.RunResult, error) {
-		// Extract agentID from session key (format: agent:{agentId}:{rest})
-		agentID := cfg.ResolveDefaultAgentID()
-		if parts := strings.SplitN(req.SessionKey, ":", 3); len(parts) >= 2 && parts[0] == "agent" {
-			agentID = parts[1]
-		}
-
-		loop, err := agents.Get(agentID)
-		if err != nil {
-			return nil, fmt.Errorf("agent %s not found: %w", agentID, err)
-		}
-		return loop.Run(ctx, req)
-	}
-}
-
 // consumeInboundMessages reads inbound messages from channels (Telegram, Discord, etc.)
 // and routes them through the scheduler/agent loop, then publishes the response back.
 // Also handles subagent announcements: routes them through the parent agent's session
 // (matching TS subagent-announce.ts pattern) so the agent can reformulate for the user.
-func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents *agent.Router, cfg *config.Config, sched *scheduler.Scheduler, channelMgr *channels.Manager, teamStore store.TeamStore, quotaChecker *channels.QuotaChecker, delegateMgr *tools.DelegateManager, sessStore store.SessionStore, agentStore store.AgentStore) {
+func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents *agent.Router, cfg *config.Config, sched *scheduler.Scheduler, channelMgr *channels.Manager, teamStore store.TeamStore, quotaChecker *channels.QuotaChecker, delegateMgr *tools.DelegateManager, sessStore store.SessionStore, agentStore store.AgentStore, contactCollector *store.ContactCollector) {
 	slog.Info("inbound message consumer started")
 
 	// Inbound message deduplication (matching TS src/infra/dedupe.ts + inbound-dedupe.ts).
@@ -129,13 +110,29 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 		}
 
 		// Persist friendly names from channel metadata into session + user profile.
-		if sessionMeta := extractSessionMetadata(msg, peerKind); len(sessionMeta) > 0 {
+		sessionMeta := extractSessionMetadata(msg, peerKind)
+		if len(sessionMeta) > 0 {
 			sessStore.SetSessionMetadata(sessionKey, sessionMeta)
 			if agentStore != nil {
 				if agentUUID, err := uuid.Parse(agentID); err == nil && agentUUID != uuid.Nil {
 					_ = agentStore.UpdateUserProfileMetadata(ctx, agentUUID, userID, sessionMeta)
 				}
 			}
+		}
+
+		// Auto-collect channel contacts for the contact selector.
+		if contactCollector != nil && msg.SenderID != "" {
+			senderNumericID := msg.SenderID
+			if idx := strings.IndexByte(senderNumericID, '|'); idx > 0 {
+				senderNumericID = senderNumericID[:idx]
+			}
+			channelType := channelMgr.ChannelTypeForName(msg.Channel)
+			if channelType == "" {
+				channelType = msg.Channel // fallback to instance name
+			}
+			displayName := sessionMeta["display_name"]
+			username := sessionMeta["username"]
+			contactCollector.EnsureContact(ctx, channelType, msg.Channel, senderNumericID, userID, displayName, username, peerKind)
 		}
 
 		// --- Quota check ---
@@ -205,8 +202,9 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 			chatIDForRun = lk
 		}
 		blockReply := channelMgr != nil && channelMgr.ResolveBlockReply(msg.Channel, cfg.Gateway.BlockReply)
+		toolStatus := cfg.Gateway.ToolStatus == nil || *cfg.Gateway.ToolStatus // default true
 		if channelMgr != nil {
-			channelMgr.RegisterRun(runID, msg.Channel, chatIDForRun, messageID, outMeta, enableStream, blockReply)
+			channelMgr.RegisterRun(runID, msg.Channel, chatIDForRun, messageID, outMeta, enableStream, blockReply, toolStatus)
 		}
 
 		// Group-aware system prompt: help the LLM adapt tone and behavior for group chats.
@@ -240,6 +238,47 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 			fwdMedia = msg.Media
 		} else {
 			reqMedia = msg.Media
+		}
+
+		// Intent classify fast-path: when agent is busy on DM, classify user intent
+		// to detect status queries, cancel requests, etc. without queueing.
+		// Only for DM (maxConcurrent=1) where messages queue behind the active run.
+		intentClassifyEnabled := cfg.Agents.Defaults.IntentClassify == nil || *cfg.Agents.Defaults.IntentClassify
+		if intentClassifyEnabled && maxConcurrent == 1 && agents.IsSessionBusy(sessionKey) {
+			if loop, ok := agentLoop.(*agent.Loop); ok && loop.Provider() != nil {
+				locale := msg.Metadata["locale"]
+				if locale == "" {
+					locale = "en"
+				}
+				intent := agent.ClassifyIntent(ctx, loop.Provider(), loop.Model(), msg.Content)
+				switch intent {
+				case agent.IntentStatusQuery:
+					status := agents.GetActivity(sessionKey)
+					reply := agent.FormatStatusReply(status, locale)
+					msgBus.PublishOutbound(bus.OutboundMessage{
+						Channel:  msg.Channel,
+						ChatID:   msg.ChatID,
+						Content:  reply,
+						Metadata: outMeta,
+					})
+					return
+				case agent.IntentCancel:
+					aborted := agents.AbortRunsForSession(sessionKey)
+					if len(aborted) > 0 {
+						slog.Info("inbound: cancelled runs via intent classify",
+							"session", sessionKey, "aborted", aborted)
+						msgBus.PublishOutbound(bus.OutboundMessage{
+							Channel:  msg.Channel,
+							ChatID:   msg.ChatID,
+							Content:  i18n.T(locale, i18n.MsgCancelledReply),
+							Metadata: outMeta,
+						})
+					}
+					return
+				default:
+					// steer / new_task → queue as normal
+				}
+			}
 		}
 
 		// Schedule through main lane (per-session concurrency controlled by maxConcurrent)
@@ -337,19 +376,7 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 				Metadata: meta,
 			}
 
-			// Convert media results from agent run to outbound media attachments
-			for _, mr := range outcome.Result.Media {
-				outMsg.Media = append(outMsg.Media, bus.MediaAttachment{
-					URL:         mr.Path,
-					ContentType: mr.ContentType,
-				})
-				if mr.AsVoice {
-					if outMsg.Metadata == nil {
-						outMsg.Metadata = make(map[string]string)
-					}
-					outMsg.Metadata["audio_as_voice"] = "true"
-				}
-			}
+			appendMediaToOutbound(&outMsg, outcome.Result.Media)
 
 			msgBus.PublishOutbound(outMsg)
 		}(msg.Channel, msg.ChatID, sessionKey, runID, outMeta, blockReply)
@@ -512,12 +539,7 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 					Content:  announceContent,
 					Metadata: meta,
 				}
-				for _, mr := range outcome.Result.Media {
-					outMsg.Media = append(outMsg.Media, bus.MediaAttachment{
-						URL:         mr.Path,
-						ContentType: mr.ContentType,
-					})
-				}
+				appendMediaToOutbound(&outMsg, outcome.Result.Media)
 				msgBus.PublishOutbound(outMsg)
 			}(sessionKey, origChannel, msg.ChatID, msg.SenderID, msg.Metadata["subagent_label"], outMeta, announceReq)
 			continue
@@ -641,12 +663,7 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 					Content:  announceContent,
 					Metadata: meta,
 				}
-				for _, mr := range outcome.Result.Media {
-					outMsg.Media = append(outMsg.Media, bus.MediaAttachment{
-						URL:         mr.Path,
-						ContentType: mr.ContentType,
-					})
-				}
+				appendMediaToOutbound(&outMsg, outcome.Result.Media)
 				msgBus.PublishOutbound(outMsg)
 			}(sessionKey, origChannel, msg.ChatID, msg.SenderID, outMeta, announceReq)
 			continue
@@ -707,15 +724,17 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 					slog.Error("handoff announce: agent run failed", "error", outcome.Err)
 					return
 				}
-				if outcome.Result.Content == "" || agent.IsSilentReply(outcome.Result.Content) {
+				if (outcome.Result.Content == "" && len(outcome.Result.Media) == 0) || agent.IsSilentReply(outcome.Result.Content) {
 					return
 				}
-				msgBus.PublishOutbound(bus.OutboundMessage{
+				outMsg := bus.OutboundMessage{
 					Channel:  origCh,
 					ChatID:   chatID,
 					Content:  outcome.Result.Content,
 					Metadata: meta,
-				})
+				}
+				appendMediaToOutbound(&outMsg, outcome.Result.Media)
+				msgBus.PublishOutbound(outMsg)
 			}(origChannel, msg.ChatID, outMeta)
 			continue
 		}
@@ -775,18 +794,20 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 					slog.Error("teammate message: agent run failed", "error", outcome.Err)
 					return
 				}
-				if outcome.Result.Content == "" || agent.IsSilentReply(outcome.Result.Content) {
+				if (outcome.Result.Content == "" && len(outcome.Result.Media) == 0) || agent.IsSilentReply(outcome.Result.Content) {
 					slog.Info("teammate message: suppressed silent/empty reply", "from", senderID)
 					return
 				}
 				// Deliver response to origin channel (same as delegate/subagent announce).
 				// This allows the lead to respond to users after receiving teammate updates.
-				msgBus.PublishOutbound(bus.OutboundMessage{
+				outMsg := bus.OutboundMessage{
 					Channel:  origCh,
 					ChatID:   chatID,
 					Content:  outcome.Result.Content,
 					Metadata: meta,
-				})
+				}
+				appendMediaToOutbound(&outMsg, outcome.Result.Media)
+				msgBus.PublishOutbound(outMsg)
 			}(origChannel, msg.ChatID, msg.SenderID, outMeta)
 			continue
 		}
@@ -863,163 +884,19 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 	}
 }
 
-// resolveAgentRoute determines which agent should handle a message
-// based on config bindings. Priority: peer → channel → default.
-// Matching TS resolve-route.ts binding resolution.
-func resolveAgentRoute(cfg *config.Config, channel, chatID, peerKind string) string {
-	for _, binding := range cfg.Bindings {
-		match := binding.Match
-		if match.Channel != channel {
-			continue
-		}
-
-		// Peer-level match (most specific)
-		if match.Peer != nil {
-			if match.Peer.Kind == peerKind && match.Peer.ID == chatID {
-				return config.NormalizeAgentID(binding.AgentID)
-			}
-			continue // has peer constraint but doesn't match — skip
-		}
-
-		// Channel-level match (least specific, no peer constraint)
-		return config.NormalizeAgentID(binding.AgentID)
-	}
-
-	return cfg.ResolveDefaultAgentID()
-}
-
-// overrideSessionKeyFromLocalKey extracts topic/thread ID from the composite
-// local_key and returns the correct session key for forum topics or DM threads.
-// If localKey is empty or has no suffix, the original sessionKey is returned unchanged.
-func overrideSessionKeyFromLocalKey(sessionKey, localKey, agentID, channel, chatID, peerKind string) string {
-	if localKey == "" {
-		return sessionKey
-	}
-	if idx := strings.Index(localKey, ":topic:"); idx > 0 && peerKind == string(sessions.PeerGroup) {
-		var topicID int
-		fmt.Sscanf(localKey[idx+7:], "%d", &topicID)
-		if topicID > 0 {
-			return sessions.BuildGroupTopicSessionKey(agentID, channel, chatID, topicID)
-		}
-	} else if idx := strings.Index(localKey, ":thread:"); idx > 0 && peerKind == string(sessions.PeerDirect) {
-		var threadID int
-		fmt.Sscanf(localKey[idx+8:], "%d", &threadID)
-		if threadID > 0 {
-			return sessions.BuildDMThreadSessionKey(agentID, channel, chatID, threadID)
-		}
-	}
-	return sessionKey
-}
-
-// extractSessionMetadata builds a metadata map from channel InboundMessage metadata.
-// Used to persist friendly names (display_name, username, chat_title) into sessions
-// and user profiles so the web UI can show human-readable labels.
-func extractSessionMetadata(msg bus.InboundMessage, peerKind string) map[string]string {
-	meta := make(map[string]string)
-
-	// Display name: prefer first_name (Telegram), fall back to display_name (Discord)
-	if v := msg.Metadata["first_name"]; v != "" {
-		meta["display_name"] = v
-	} else if v := msg.Metadata["display_name"]; v != "" {
-		meta["display_name"] = v
-	}
-
-	if v := msg.Metadata["username"]; v != "" {
-		meta["username"] = v
-	}
-	if peerKind != "" {
-		meta["peer_kind"] = peerKind
-	}
-	if v := msg.Metadata["chat_title"]; v != "" {
-		meta["chat_title"] = v
-	}
-
-	if len(meta) == 0 {
-		return nil
-	}
-	return meta
-}
-
-// buildAnnounceOutMeta builds outbound metadata for announce messages so that
-// Send() can route replies to the correct forum topic or DM thread.
-// mediaToMarkdown converts media results to markdown image/link syntax using the
-// /v1/files/ HTTP endpoint. Used for WS channel where outbound media attachments
-// are not supported (no channel handler). Returns empty string if no media.
-// Uses absolute file paths with the /v1/files endpoint (auth-token protected).
-// Generates relative URLs (/v1/files/...) so they work regardless of the server's
-// external hostname — the browser resolves them from the current origin.
-func mediaToMarkdown(media []agent.MediaResult, cfg *config.Config) string {
-	if len(media) == 0 {
-		return ""
-	}
-
-	tokenQuery := ""
-	if cfg.Gateway.Token != "" {
-		tokenQuery = "?token=" + cfg.Gateway.Token
-	}
-
-	var parts []string
+// appendMediaToOutbound converts agent MediaResults to outbound MediaAttachments
+// on the given OutboundMessage. Handles voice annotation when applicable.
+func appendMediaToOutbound(msg *bus.OutboundMessage, media []agent.MediaResult) {
 	for _, mr := range media {
-		cleanPath := filepath.Clean(mr.Path)
-		// Strip leading "/" so URL path is /v1/files/app/.goclaw/...
-		urlPath := strings.TrimPrefix(cleanPath, "/")
-		if urlPath == "" {
-			continue
-		}
-		fileURL := "/v1/files/" + urlPath + tokenQuery
-		if strings.HasPrefix(mr.ContentType, "image/") {
-			parts = append(parts, fmt.Sprintf("![image](%s)", fileURL))
-		} else {
-			parts = append(parts, fmt.Sprintf("[%s](%s)", filepath.Base(mr.Path), fileURL))
-		}
-	}
-	if len(parts) == 0 {
-		return ""
-	}
-	return "\n\n" + strings.Join(parts, "\n")
-}
-
-// mediaToMarkdownFromPaths is like mediaToMarkdown but accepts raw file paths
-// ([]string from bus.InboundMessage.Media) instead of []agent.MediaResult.
-func mediaToMarkdownFromPaths(files []bus.MediaFile, cfg *config.Config) string {
-	if len(files) == 0 {
-		return ""
-	}
-	media := make([]agent.MediaResult, 0, len(files))
-	for _, f := range files {
-		ct := f.MimeType
-		if ct == "" {
-			ct = mime.TypeByExtension(filepath.Ext(f.Path))
-		}
-		if ct == "" {
-			ct = "application/octet-stream"
-		}
-		media = append(media, agent.MediaResult{
-			Path:        f.Path,
-			ContentType: ct,
+		msg.Media = append(msg.Media, bus.MediaAttachment{
+			URL:         mr.Path,
+			ContentType: mr.ContentType,
 		})
+		if mr.AsVoice {
+			if msg.Metadata == nil {
+				msg.Metadata = make(map[string]string)
+			}
+			msg.Metadata["audio_as_voice"] = "true"
+		}
 	}
-	return mediaToMarkdown(media, cfg)
-}
-
-func buildAnnounceOutMeta(localKey string) map[string]string {
-	if localKey == "" {
-		return nil
-	}
-	meta := map[string]string{"local_key": localKey}
-	if idx := strings.Index(localKey, ":topic:"); idx > 0 {
-		meta["message_thread_id"] = localKey[idx+7:]
-	} else if idx := strings.Index(localKey, ":thread:"); idx > 0 {
-		meta["message_thread_id"] = localKey[idx+8:]
-	}
-	return meta
-}
-
-// resolveChannelType returns the platform type for a channel instance name.
-// Returns empty string if channelMgr is nil or channel name is empty.
-func resolveChannelType(channelMgr *channels.Manager, name string) string {
-	if channelMgr == nil || name == "" {
-		return ""
-	}
-	return channelMgr.ChannelTypeForName(name)
 }

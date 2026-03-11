@@ -79,10 +79,16 @@ func (c *Channel) handleMessageEvent(ctx context.Context, event *MessageEvent) {
 			}
 			c.groupHistory.Record(historyKey, channels.HistoryEntry{
 				Sender:    senderName,
+				SenderID:  mc.SenderID,
 				Body:      mc.Content,
 				Timestamp: time.Now(),
 				MessageID: messageID,
 			}, c.historyLimit)
+
+			// Collect contact even when bot is not mentioned (cache prevents DB spam).
+			if cc := c.ContactCollector(); cc != nil {
+				cc.EnsureContact(ctx, c.Type(), c.Name(), mc.SenderID, mc.SenderID, senderName, "", "group")
+			}
 
 			slog.Debug("feishu group message recorded (no mention)",
 				"chat_id", mc.ChatID, "sender", senderName,
@@ -130,7 +136,7 @@ func (c *Channel) handleMessageEvent(ctx context.Context, event *MessageEvent) {
 		"chat_type":     mc.ChatType,
 		"sender_name":   senderName,
 		"mentioned_bot": fmt.Sprintf("%t", mc.MentionedBot),
-		"platform":      "feishu",
+		"platform":      channels.TypeFeishu,
 	}
 
 	if sender != nil {

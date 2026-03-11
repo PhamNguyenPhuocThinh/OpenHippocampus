@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 
 	"github.com/nextlevelbuilder/goclaw/internal/agent"
@@ -19,6 +20,7 @@ import (
 	httpapi "github.com/nextlevelbuilder/goclaw/internal/http"
 	mcpbridge "github.com/nextlevelbuilder/goclaw/internal/mcp"
 	"github.com/nextlevelbuilder/goclaw/internal/permissions"
+	"github.com/nextlevelbuilder/goclaw/internal/providers"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 	"github.com/nextlevelbuilder/goclaw/internal/tools"
 	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
@@ -38,18 +40,24 @@ type Server struct {
 	agentsHandler  *httpapi.AgentsHandler // agent CRUD API
 	skillsHandler  *httpapi.SkillsHandler // skill management API
 	tracesHandler  *httpapi.TracesHandler // LLM trace listing API
+	wakeHandler    *httpapi.WakeHandler  // external wake/trigger API
 	mcpHandler         *httpapi.MCPHandler         // MCP server management API
 	customToolsHandler      *httpapi.CustomToolsHandler      // custom tool CRUD API
 	channelInstancesHandler *httpapi.ChannelInstancesHandler // channel instance CRUD API
 	providersHandler        *httpapi.ProvidersHandler        // provider CRUD API
 	delegationsHandler      *httpapi.DelegationsHandler      // delegation history API
 	builtinToolsHandler     *httpapi.BuiltinToolsHandler     // builtin tool management API
+	pendingMessagesHandler  *httpapi.PendingMessagesHandler  // pending messages API
+	memoryHandler           *httpapi.MemoryHandler           // memory management API
+	kgHandler               *httpapi.KnowledgeGraphHandler   // knowledge graph API
 	oauthHandler            *httpapi.OAuthHandler            // OAuth endpoints
 	filesHandler            *httpapi.FilesHandler            // workspace file serving
 	storageHandler          *httpapi.StorageHandler          // storage file management
 	mediaUploadHandler      *httpapi.MediaUploadHandler      // media upload endpoint
 	mediaServeHandler       *httpapi.MediaServeHandler       // media serve endpoint
+	activityHandler         *httpapi.ActivityHandler         // activity audit log API
 	agentStore         store.AgentStore             // for context injection in tools_invoke
+	msgBus             *bus.MessageBus              // for MCP bridge media delivery
 
 	upgrader    websocket.Upgrader
 	rateLimiter *RateLimiter
@@ -154,49 +162,69 @@ func (s *Server) BuildMux() *http.ServeMux {
 		mux.Handle("/v1/tools/invoke", toolsHandler)
 	}
 
-	// Managed mode: agent CRUD + shares API
+	// Agent CRUD + shares API
 	if s.agentsHandler != nil {
 		s.agentsHandler.RegisterRoutes(mux)
 	}
 
-	// Managed mode: skill management API
+	// Skill management API
 	if s.skillsHandler != nil {
 		s.skillsHandler.RegisterRoutes(mux)
 	}
 
-	// Managed mode: LLM trace listing API
+	// LLM trace listing API
 	if s.tracesHandler != nil {
 		s.tracesHandler.RegisterRoutes(mux)
 	}
 
-	// Managed mode: MCP server management API
+	// External wake/trigger API
+	if s.wakeHandler != nil {
+		s.wakeHandler.RegisterRoutes(mux)
+	}
+
+	// MCP server management API
 	if s.mcpHandler != nil {
 		s.mcpHandler.RegisterRoutes(mux)
 	}
 
-	// Managed mode: custom tool CRUD API
+	// Custom tool CRUD API
 	if s.customToolsHandler != nil {
 		s.customToolsHandler.RegisterRoutes(mux)
 	}
 
-	// Managed mode: channel instance CRUD API
+	// Channel instance CRUD API
 	if s.channelInstancesHandler != nil {
 		s.channelInstancesHandler.RegisterRoutes(mux)
 	}
 
-	// Managed mode: provider & model CRUD API
+	// Provider & model CRUD API
 	if s.providersHandler != nil {
 		s.providersHandler.RegisterRoutes(mux)
 	}
 
-	// Managed mode: delegation history API
+	// Delegation history API
 	if s.delegationsHandler != nil {
 		s.delegationsHandler.RegisterRoutes(mux)
 	}
 
-	// Managed mode: builtin tool management API
+	// Builtin tool management API
 	if s.builtinToolsHandler != nil {
 		s.builtinToolsHandler.RegisterRoutes(mux)
+	}
+
+	// Pending messages API
+	if s.pendingMessagesHandler != nil {
+		s.pendingMessagesHandler.RegisterRoutes(mux)
+	}
+
+	// Memory management API
+	if s.memoryHandler != nil {
+		s.memoryHandler.RegisterRoutes(mux)
+	}
+
+	// Knowledge graph API
+	if s.kgHandler != nil {
+		s.kgHandler.RegisterRoutes(mux)
 	}
 
 	// Workspace file serving (available in all modes)
@@ -219,6 +247,10 @@ func (s *Server) BuildMux() *http.ServeMux {
 		s.mediaServeHandler.RegisterRoutes(mux)
 	}
 
+	if s.activityHandler != nil {
+		s.activityHandler.RegisterRoutes(mux)
+	}
+
 	// OAuth endpoints (available in all modes)
 	if s.oauthHandler != nil {
 		s.oauthHandler.RegisterRoutes(mux)
@@ -227,18 +259,70 @@ func (s *Server) BuildMux() *http.ServeMux {
 	// MCP bridge: expose GoClaw tools to Claude CLI via streamable-http.
 	// Only listens on localhost (CLI runs on the same machine).
 	// Protected by gateway token when configured.
+	// Agent context (X-Agent-ID, X-User-ID) is injected from request headers.
 	if s.tools != nil {
-		bridgeHandler := mcpbridge.NewBridgeServer(s.tools, "1.0.0")
+		bridgeHandler := mcpbridge.NewBridgeServer(s.tools, "1.0.0", s.msgBus)
+		var handler http.Handler = bridgeContextMiddleware(s.cfg.Gateway.Token, bridgeHandler)
 		if s.cfg.Gateway.Token != "" {
-			mux.Handle("/mcp/bridge", tokenAuthMiddleware(s.cfg.Gateway.Token, bridgeHandler))
+			handler = tokenAuthMiddleware(s.cfg.Gateway.Token, handler)
 		} else {
 			slog.Warn("security.mcp_bridge: no gateway token configured, MCP bridge tools are unauthenticated")
-			mux.Handle("/mcp/bridge", bridgeHandler)
 		}
+		mux.Handle("/mcp/bridge", handler)
 	}
 
 	s.mux = mux
 	return mux
+}
+
+// bridgeContextMiddleware extracts X-Agent-ID and X-User-ID headers from the
+// MCP bridge request and injects them into the context so bridge tools can
+// access agent/user scope. When a gateway token is configured, the context
+// headers must be accompanied by a valid X-Bridge-Sig HMAC to prevent forgery.
+func bridgeContextMiddleware(gatewayToken string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+		agentIDStr := r.Header.Get("X-Agent-ID")
+		userID := r.Header.Get("X-User-ID")
+		channel := r.Header.Get("X-Channel")
+		chatID := r.Header.Get("X-Chat-ID")
+		peerKind := r.Header.Get("X-Peer-Kind")
+
+		if agentIDStr != "" || userID != "" {
+			// Verify HMAC signature over all context fields when gateway token is configured
+			if gatewayToken != "" {
+				sig := r.Header.Get("X-Bridge-Sig")
+				if !providers.VerifyBridgeContext(gatewayToken, agentIDStr, userID, channel, chatID, peerKind, sig) {
+					slog.Warn("security.mcp_bridge: invalid bridge context signature",
+						"agent_id", agentIDStr, "user_id", userID)
+					http.Error(w, `{"error":"invalid bridge context signature"}`, http.StatusForbidden)
+					return
+				}
+			}
+
+			if agentIDStr != "" {
+				if id, err := uuid.Parse(agentIDStr); err == nil {
+					ctx = store.WithAgentID(ctx, id)
+				}
+			}
+			if userID != "" {
+				ctx = store.WithUserID(ctx, userID)
+			}
+		}
+
+		// Inject channel routing context for tools like message, cron, etc.
+		if channel != "" {
+			ctx = tools.WithToolChannel(ctx, channel)
+		}
+		if chatID != "" {
+			ctx = tools.WithToolChatID(ctx, chatID)
+		}
+		if peerKind != "" {
+			ctx = tools.WithToolPeerKind(ctx, peerKind)
+		}
+
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
 }
 
 // tokenAuthMiddleware wraps an http.Handler with Bearer token authentication.
@@ -337,6 +421,9 @@ func (s *Server) SetSkillsHandler(h *httpapi.SkillsHandler) { s.skillsHandler = 
 // SetTracesHandler sets the LLM trace listing handler.
 func (s *Server) SetTracesHandler(h *httpapi.TracesHandler) { s.tracesHandler = h }
 
+// SetWakeHandler sets the external wake/trigger handler.
+func (s *Server) SetWakeHandler(h *httpapi.WakeHandler) { s.wakeHandler = h }
+
 // SetMCPHandler sets the MCP server management handler.
 func (s *Server) SetMCPHandler(h *httpapi.MCPHandler) { s.mcpHandler = h }
 
@@ -353,6 +440,11 @@ func (s *Server) SetProvidersHandler(h *httpapi.ProvidersHandler) { s.providersH
 
 // SetDelegationsHandler sets the delegation history handler.
 func (s *Server) SetDelegationsHandler(h *httpapi.DelegationsHandler) { s.delegationsHandler = h }
+
+// SetPendingMessagesHandler sets the pending messages handler.
+func (s *Server) SetPendingMessagesHandler(h *httpapi.PendingMessagesHandler) {
+	s.pendingMessagesHandler = h
+}
 
 // SetBuiltinToolsHandler sets the builtin tool management handler.
 func (s *Server) SetBuiltinToolsHandler(h *httpapi.BuiltinToolsHandler) {
@@ -374,8 +466,20 @@ func (s *Server) SetMediaUploadHandler(h *httpapi.MediaUploadHandler) { s.mediaU
 // SetMediaServeHandler sets the media serve handler.
 func (s *Server) SetMediaServeHandler(h *httpapi.MediaServeHandler) { s.mediaServeHandler = h }
 
+// SetMemoryHandler sets the memory management handler.
+func (s *Server) SetMemoryHandler(h *httpapi.MemoryHandler) { s.memoryHandler = h }
+
+// SetKnowledgeGraphHandler sets the knowledge graph handler.
+func (s *Server) SetKnowledgeGraphHandler(h *httpapi.KnowledgeGraphHandler) { s.kgHandler = h }
+
+// SetActivityHandler sets the activity audit log handler.
+func (s *Server) SetActivityHandler(h *httpapi.ActivityHandler) { s.activityHandler = h }
+
 // SetAgentStore sets the agent store for context injection in tools_invoke.
 func (s *Server) SetAgentStore(as store.AgentStore) { s.agentStore = as }
+
+// SetMessageBus sets the message bus for MCP bridge media delivery.
+func (s *Server) SetMessageBus(mb *bus.MessageBus) { s.msgBus = mb }
 
 // SetVersion sets the server version for health responses.
 func (s *Server) SetVersion(v string) { s.version = v }

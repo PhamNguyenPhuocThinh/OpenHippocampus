@@ -141,10 +141,16 @@ func (c *Channel) handleMessage(_ *discordgo.Session, m *discordgo.MessageCreate
 		if !mentioned {
 			c.groupHistory.Record(channelID, channels.HistoryEntry{
 				Sender:    senderName,
+				SenderID:  senderID,
 				Body:      content,
 				Timestamp: m.Timestamp,
 				MessageID: m.ID,
 			}, c.historyLimit)
+
+			// Collect contact even when bot is not mentioned (cache prevents DB spam).
+			if cc := c.ContactCollector(); cc != nil {
+				cc.EnsureContact(context.Background(), c.Type(), c.Name(), senderID, senderID, senderName, m.Author.Username, "group")
+			}
 
 			slog.Debug("discord group message recorded (no mention)",
 				"channel_id", channelID,

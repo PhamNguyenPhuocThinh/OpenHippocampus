@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useTranslation } from "react-i18next";
 import { Circle } from "lucide-react";
 import { MessageBubble } from "@/components/chat/message-bubble";
 import { StreamingText } from "@/components/chat/streaming-text";
@@ -27,24 +27,12 @@ export function ChatThread({
   loading,
   scrollTrigger = 0,
 }: ChatThreadProps) {
+  const { t } = useTranslation("chat");
   const { ref, onScroll } = useAutoScroll<HTMLDivElement>(
     [messages.length, streamText, thinkingText, toolStream.length],
     100,
     scrollTrigger,
   );
-
-  // Build map of tool_call_id → error content for tool results that indicate errors
-  const toolCallErrors = useMemo(() => {
-    const errors = new Map<string, string>();
-    for (const msg of messages) {
-      if (msg.role !== "tool" || !msg.tool_call_id || !msg.content) continue;
-      const c = msg.content.trimStart();
-      if (c.startsWith("Error") || c.startsWith("error:") || c.includes("failed:") || c.includes("Failed:")) {
-        errors.set(msg.tool_call_id, msg.content);
-      }
-    }
-    return errors;
-  }, [messages]);
 
   // Show spinner while loading history for a different session
   if (loading) {
@@ -58,8 +46,8 @@ export function ChatThread({
   if (messages.length === 0 && !isRunning) {
     return (
       <div className="flex flex-1 flex-col items-center justify-center gap-2 text-muted-foreground">
-        <p className="text-lg font-medium">Start a conversation</p>
-        <p className="text-sm">Send a message to begin chatting with the agent.</p>
+        <p className="text-lg font-medium">{t("empty.title")}</p>
+        <p className="text-sm">{t("empty.description")}</p>
       </div>
     );
   }
@@ -72,7 +60,7 @@ export function ChatThread({
     >
       <div className="mx-auto max-w-3xl space-y-4">
         {messages.map((msg, i) => (
-          <MessageBubble key={`${msg.role}-${i}`} message={msg} toolCallErrors={toolCallErrors} />
+          <MessageBubble key={`${msg.role}-${i}`} message={msg} />
         ))}
 
         {/* Tool stream during active run */}
